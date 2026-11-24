@@ -28,14 +28,12 @@ const TARGET = 319;
 const MAX_FOAM = 45;      // the most foam (in ml-sized height)
 const FOAM_GROW = 0.12;   // foam added per ml poured
 const FOAM_FADE = 30;     // foam that disappears every second
-const STORAGE_KEY = "pourRecords";
 
 // the records board (change these numbers to move or resize it)
 const BOARD_X = 272;      // left edge (bigger = more space from the ml numbers)
 const BOARD_Y = 40;       // top edge
 const BOARD_W = 142;      // width
 const BOARD_H = 340;      // height of the ranking box
-const MAX_RECORDS = 100;  // how many records we keep
 
 // make the drawing exactly wide enough for the board
 scene.setAttribute("viewBox", "0 -110 " + (BOARD_X + BOARD_W + 8) + " 530");
@@ -202,23 +200,27 @@ saveNameBtn.addEventListener("click", function () {
   }, 1500);
 });
 
-// ---------- records ----------
-function loadRecords() {
-  try {
-    const saved = localStorage.getItem(STORAGE_KEY);
-    return saved ? JSON.parse(saved) : [];
-  } catch (e) {
-    return [];
-  }
-}
+// ---------- shared ranking (Firebase) ----------
+const FIREBASE_CONFIG = {
+  apiKey: "AIzaSyAjeYitx3Uv_BalfQpx2nuDiIMRRln2ga0",
+  authDomain: "nunchi-game-test-d2500.firebaseapp.com",
+  databaseURL: "https://nunchi-game-test-d2500-default-rtdb.asia-southeast1.firebasedatabase.app",
+  projectId: "nunchi-game-test-d2500",
+  storageBucket: "nunchi-game-test-d2500.firebasestorage.app",
+  messagingSenderId: "122509816",
+  appId: "1:122509816:web:4e4fe122671ee6529c9e0d"
+};
+const DB_PATH = "pourRanking";   // the folder in the database
+const SHOW_TOP = 50;             // how many best scores we load
+const DAY_START_HOUR = 6;        // a new ranking day starts at 6 am (Seoul time)
 
-function saveRecords(list) {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(list));
-  } catch (e) {
-    // storage is blocked (for example a private window): the game still works
-  }
-}
+let dbTools = null;      // the Firebase functions (loaded in connectRanking)
+let db = null;           // the database
+let stopListening = null; // stops listening to an old day
+let currentDay = "";     // the day we are showing, like 2026-11-24
+let records = [];        // the best scores, best first
+let myKey = "";          // the id of the score I just sent
+let resultBase = "";     // the result text without the rank line
 
 // build the board once: a box with a title and a scrolling list
 const box = document.createElementNS(SVG_NS, "foreignObject");
@@ -234,68 +236,109 @@ box.appendChild(boardBox);
 
 const title = document.createElement("div");
 title.className = "boardTitle";
-title.textContent = "랭킹";
+title.textContent = "오늘의 랭킹";
 boardBox.appendChild(title);
 
 const listEl = document.createElement("div");
 listEl.id = "recList";
 boardBox.appendChild(listEl);
 
-// reset button: first tap asks, second tap really deletes
-const resetBtn = document.createElement("button");
-resetBtn.id = "resetBoard";
-resetBtn.textContent = "랭킹 지우기";
-boardBox.appendChild(resetBtn);
-
-let resetTimer = null;
-resetBtn.addEventListener("click", function () {
-  if (resetBtn.classList.contains("ask")) {
-    clearTimeout(resetTimer);
-    resetBtn.classList.remove("ask");
-    resetBtn.textContent = "랭킹 지우기";
-    saveRecords([]);
-    showRecords(-1);
-  } else {
-    resetBtn.classList.add("ask");
-    resetBtn.textContent = "정말 지울까요?";
-    resetTimer = setTimeout(function () {
-      resetBtn.classList.remove("ask");
-      resetBtn.textContent = "랭킹 지우기";
-    }, 3000);
-  }
-});
-
-// fill the list; newIndex is the row to blink (or -1 for none)
-function showRecords(newIndex) {
-  const list = loadRecords();
+// show the list; my newest score blinks
+function showRecords() {
   listEl.innerHTML = "";
-  if (list.length === 0) {
+  if (records.length === 0) {
     listEl.textContent = "아직 없어요";
     return;
   }
-  list.forEach(function (r, i) {
+  records.forEach(function (r, i) {
     const row = document.createElement("div");
-    row.className = i === newIndex ? "recRow new" : "recRow";
-    row.textContent = (i + 1) + " " + r.name.slice(0, 5) + "  " + r.ml;
+    row.className = r.key === myKey ? "recRow new" : "recRow";
+    row.textContent = (i + 1) + " " + String(r.name).slice(0, 5) + "  " + r.ml;
     listEl.appendChild(row);
-    if (i === newIndex) {
+    if (r.key === myKey) {
       listEl.scrollTop = Math.max(0, row.offsetTop - 40);
     }
   });
 }
 
-// returns the rank (1 or more) of the new score
-function addRecord(name, shownMl, diff) {
-  const list = loadRecords();
-  const entry = { name: name, ml: shownMl, diff: diff };
-  list.push(entry);
-  list.sort(function (a, b) {
-    return a.diff - b.diff;
+// add my rank to the result text once the list knows my score
+function showMyRank() {
+  if (!myKey || result.hidden) {
+    return;
+  }
+  const i = records.findIndex(function (r) {
+    return r.key === myKey;
   });
-  const rank = list.indexOf(entry) + 1;
-  saveRecords(list.slice(0, MAX_RECORDS));
-  showRecords(rank - 1);
-  return rank;
+  if (i >= 0) {
+    resultText.textContent = resultBase + "\n전체 " + (i + 1) + "위!";
+  }
+}
+
+// today's name, like "2026-11-24" (the day changes at 6 am Seoul time)
+function todayKey() {
+  const shifted = new Date(Date.now() - DAY_START_HOUR * 60 * 60 * 1000);
+  return shifted.toLocaleDateString("sv-SE", { timeZone: "Asia/Seoul" });
+}
+
+// listen to today's ranking folder (and stop listening to the old one)
+function listenToday() {
+  if (!dbTools || !db) {
+    return;
+  }
+  if (stopListening) {
+    stopListening();
+    stopListening = null;
+  }
+  currentDay = todayKey();
+  records = [];
+  myKey = "";
+  showRecords();
+
+  const dayRef = dbTools.ref(db, DB_PATH + "/" + currentDay);
+  // the best scores: smallest difference first
+  const top = dbTools.query(dayRef, dbTools.orderByChild("diff"), dbTools.limitToFirst(SHOW_TOP));
+  stopListening = dbTools.onValue(top, function (snapshot) {
+    const list = [];
+    snapshot.forEach(function (child) {
+      const v = child.val();
+      list.push({ key: child.key, name: v.name, ml: v.ml, diff: v.diff });
+    });
+    records = list;
+    showRecords();
+    showMyRank();
+  }, function () {
+    listEl.textContent = "랭킹 연결 실패";
+  });
+}
+
+// connect to Firebase; if it fails the game still works
+async function connectRanking() {
+  try {
+    const appTools = await import("https://www.gstatic.com/firebasejs/10.14.1/firebase-app.js");
+    dbTools = await import("https://www.gstatic.com/firebasejs/10.14.1/firebase-database.js");
+    const app = appTools.initializeApp(FIREBASE_CONFIG);
+    db = dbTools.getDatabase(app);
+    listenToday();
+  } catch (e) {
+    listEl.textContent = "랭킹 연결 실패";
+  }
+}
+
+// send my score to today's ranking
+function sendRecord(name, shownMl, diff) {
+  if (!dbTools || !db) {
+    return;
+  }
+  try {
+    const dayRef = dbTools.ref(db, DB_PATH + "/" + currentDay);
+    const newRef = dbTools.push(dayRef, {
+      name: name,
+      ml: shownMl,
+      diff: diff,
+      t: Date.now()
+    });
+    myKey = newRef.key;
+  } catch (e) {}
 }
 
 function setBeer() {
@@ -376,14 +419,16 @@ function showResult(shown, diff) {
   else { rating = "너무 달라요! Way off"; }
   let text = rating + "\n" + shown + " ml (목표 " + TARGET + ", 차이 " + diff + ")";
 
+  resultBase = text;
+  myKey = "";
   if (shown < MAX_ML) {
     const name = nameInput.value.trim() || "이름없음";
-    const rank = addRecord(name, shown, diff);
-    text = text + "\n랭킹 " + rank + "위!";
+    sendRecord(name, shown, diff);
   }
   resultText.textContent = text;
   result.hidden = false;
   hint.textContent = "";
+  showMyRank();
 
   if (shown < MAX_ML && diff <= 10) {
     sfxGood();
@@ -393,6 +438,10 @@ function showResult(shown, diff) {
 }
 
 function reset() {
+  // if the day changed while the page was open, switch to the new day
+  if (dbTools && todayKey() !== currentDay) {
+    listenToday();
+  }
   ml = 0; foam = 0; pouring = false; finished = false;
   result.hidden = true;
   ring.style.display = "";
@@ -440,5 +489,6 @@ function loop(now) {
   number.textContent = Math.floor(ml) + " ml";
   requestAnimationFrame(loop);
 }
-showRecords(-1);
+showRecords();
+connectRanking();
 requestAnimationFrame(loop);
